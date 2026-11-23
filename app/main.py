@@ -20,6 +20,7 @@ from .service import (
     get_coil,
     query_p95,
     refine_bucket,
+    submit_bulk,
     submit_reports,
 )
 
@@ -86,7 +87,9 @@ class CoilOut(BaseModel):
     line_id: str
     coil_id: str
     production_day: date
-    version: int = Field(description="该日汇总每成功提交一次加一；失败不改变")
+    version: int = Field(
+        description="现行版本：单卷报送、细化或批量发布每成功一次加一；失败不变"
+    )
     buckets: list[BucketOut]
 
 
@@ -159,7 +162,12 @@ def create_app(database: str | None = None) -> FastAPI:
             "按卷报送分档计数，用更窄子档细化；按产线与日期范围查询 P95 的"
             "最小/最大可能值，并列出需要补细分数据的卷与档。"
             "P95 秩为第 ceil(0.95×测点数) 小的测值；只读日汇总（分档计数），"
-            "不展开测点。"
+            "不展开测点。\n\n"
+            "批量报送 /reports/bulk 采用“分块准备 + 整批发布”：准备数据写入"
+            "私有批次区（每个写事务最多 1024 条分档），期间单卷报送和细化"
+            "（含本批卷）照常提交；发布只切换批次指针、不读写分档表，整批"
+            "同时生效。所有查询只读取已生效的卷报，且单次查询的全部数据来自"
+            "同一个已提交快照。"
         ),
         version=__version__,
         docs_url="/docs",
@@ -218,16 +226,25 @@ def create_app(database: str | None = None) -> FastAPI:
         "/reports/bulk",
         response_model=list[CoilOut],
         status_code=status.HTTP_201_CREATED,
-        summary="批量报送多卷日汇总（整批原子生效）",
+        summary="批量报送多卷日汇总（分块准备，整批同时发布生效）",
         description=(
-            "适合一条产线一天上千卷的上报。整批在同一事务中生效：任一卷不合格，"
-            "全部回滚，原数据不变。同一批内不得重复同一个 (产线, 生产日, 卷号)。"
+            "适合班末几千卷的补报。请求与响应格式与单卷报送一致：入参为 reports "
+            "列表，返回每卷生效后的分档与版本，顺序与入参相同。\n\n"
+            "处理分两阶段：\n"
+            "1. 准备（staging）：各卷分档写入私有批次区，每个 SQLite 写事务最多 "
+            "1024 条分档，事务都很短；准备中的分档对外不可见。此期间单卷报送与"
+            "细化（包括本批涉及的卷）仍可正常提交。\n"
+            "2. 发布（publish）：一个不读写任何分档表的短事务只切换各卷的批次"
+            "指针，整批同时生效。各卷版本取发布前现行版本加一，全新卷从 1 起。\n\n"
+            "整批失败时本批分档始终不可见，准备期间已提交的单卷报送与细化照常"
+            "保留。同一批内不得重复同一个 (产线, 生产日, 卷号)；任一卷分档校验"
+            "失败则整批不发布。"
         ),
     )
     def post_bulk(
         payload: Annotated[BulkReportIn, Body()], conn: Conn
     ) -> list[CoilOut]:
-        states = submit_reports(
+        states = submit_bulk(
             conn,
             [
                 (
@@ -290,9 +307,10 @@ def create_app(database: str | None = None) -> FastAPI:
         response_model=P95Out,
         summary="按产线与日期范围查询 P95 的最小/最大可能值",
         description=(
-            "只读取日汇总（分档计数），按秩 ceil(0.95×N) 计算；下界取各档下界的"
-            "加权第 k 小，上界取各档上界的加权第 k 小。两端与候选分档在同一只读"
-            "事务快照中取得，即来自同一次提交。无测点时 has_data=false 且各值为 null。"
+            "只读取已生效卷报的日汇总（分档计数），准备中的批量分档不可见；"
+            "按秩 ceil(0.95×N) 计算；下界取各档下界的加权第 k 小，上界取各档"
+            "上界的加权第 k 小。下界、上界、秩与候选分档在同一只读事务快照中"
+            "取得，即来自同一次提交。无测点时 has_data=false 且各值为 null。"
         ),
     )
     def read_p95(
